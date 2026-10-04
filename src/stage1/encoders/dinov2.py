@@ -11,13 +11,14 @@ class Dinov2withNorm(nn.Module):
         self,
         dinov2_path: str,
         normalize: bool = True,
+        revision: str = 'main',
     ):
         super().__init__()
         # Support both local paths and HuggingFace model IDs
         try:
-            self.encoder = Dinov2WithRegistersModel.from_pretrained(dinov2_path, local_files_only=True)
+            self.encoder = Dinov2WithRegistersModel.from_pretrained(dinov2_path, revision=revision, local_files_only=True)
         except (OSError, ValueError, AttributeError):
-            self.encoder = Dinov2WithRegistersModel.from_pretrained(dinov2_path, local_files_only=False)
+            self.encoder = Dinov2WithRegistersModel.from_pretrained(dinov2_path, revision=revision, local_files_only=False)
         self.encoder.requires_grad_(False)
         if normalize:
             self.encoder.layernorm.elementwise_affine = False

@@ -1,0 +1,16 @@
+stage_1:
+  target: stage1.RAE
+  params:
+    encoder_cls: Dinov2withNorm
+    encoder_config_path: facebook/dinov2-with-registers-base
+    encoder_input_size: 224
+    encoder_params:
+      dinov2_path: facebook/dinov2-with-registers-base
+      normalize: true
+      revision: main # resolved to an immutable snapshot in each training run
+    decoder_config_path: configs/decoder/ViTXL
+    pretrained_decoder_path: models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt
+    strict_decoder_loading: true
+    noise_tau: 0.0
+    reshape_to_2d: true
+    normalization_stat_path: null

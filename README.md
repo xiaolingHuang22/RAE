@@ -367,3 +367,6 @@ This code is built upon the following repositories:
 * [DDT](https://github.com/MCG-NJU/DDT) - for some of the DiT<sup>DH</sup> implementation.
 * [LightningDiT](https://github.com/hustvl/LightningDiT/) - for the PyTorch Lightning based DiT implementation.
 * [MAE](https://github.com/facebookresearch/mae) - for the ViT decoder architecture.
+### Grayscale spectrogram Stage 1 workflow
+
+See [SPECTROGRAMS.md](SPECTROGRAMS.md) for patient-disjoint decoder fine-tuning, training/validation loss plots, normalized HWC latent caches, and portable decoding.

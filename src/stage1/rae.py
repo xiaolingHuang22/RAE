@@ -30,6 +30,7 @@ class RAE(nn.Module):
         reshape_to_2d: bool = True,
         normalization_stat_path: Optional[str] = None,
         eps: float = 1e-5,
+        strict_decoder_loading: bool = False,
     ):
         super().__init__()
         encoder_cls = ARCHS[encoder_cls]
@@ -56,10 +57,11 @@ class RAE(nn.Module):
         if pretrained_decoder_path is not None:
             print(f"Loading pretrained decoder from {pretrained_decoder_path}")
             state_dict = torch.load(pretrained_decoder_path, map_location='cpu')
-            keys = self.decoder.load_state_dict(state_dict, strict=False)
+            keys = self.decoder.load_state_dict(state_dict, strict=strict_decoder_loading)
             if len(keys.missing_keys) > 0:
                 print(f"Missing keys when loading pretrained decoder: {keys.missing_keys}")
         self.noise_tau = noise_tau
+        self.eps = eps
         self.reshape_to_2d = reshape_to_2d
         if normalization_stat_path is not None:
             stats = torch.load(normalization_stat_path, map_location='cpu')
