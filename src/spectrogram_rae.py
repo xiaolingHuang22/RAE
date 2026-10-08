@@ -79,6 +79,36 @@ def amp_context(device, precision):
     return torch.autocast('cuda', dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
 
 
+def reconstruction_metrics(recon, target):
+    """Per-image metrics on unclipped RGB floats, fixed data range 1.
+
+    SSIM uses an 11x11 Gaussian (sigma 1.5), population covariance, valid
+    windows and channel averaging. PSNR has a documented 120 dB numerical cap.
+    """
+    error = recon.float() - target.float()
+    mse = error.square().mean(dim=(1, 2, 3))
+    channels = target.shape[1]
+    axis = torch.arange(11, device=target.device, dtype=torch.float32) - 5
+    gaussian = torch.exp(-axis.square() / (2 * 1.5 ** 2))
+    gaussian /= gaussian.sum()
+    horizontal = gaussian.view(1, 1, 1, 11).expand(channels, 1, 1, 11).contiguous()
+    vertical = gaussian.view(1, 1, 11, 1).expand(channels, 1, 11, 1).contiguous()
+    def smooth(x):
+        x = torch.nn.functional.conv2d(x, horizontal, groups=channels)
+        return torch.nn.functional.conv2d(x, vertical, groups=channels)
+    x, y = recon.float(), target.float()
+    mu_x, mu_y = smooth(x), smooth(y)
+    var_x = (smooth(x.square()) - mu_x.square()).clamp_min(0)
+    var_y = (smooth(y.square()) - mu_y.square()).clamp_min(0)
+    covariance = smooth(x * y) - mu_x * mu_y
+    ssim_map = ((2 * mu_x * mu_y + .01 ** 2) * (2 * covariance + .03 ** 2)
+                / ((mu_x.square() + mu_y.square() + .01 ** 2)
+                   * (var_x + var_y + .03 ** 2)))
+    return {'mse': mse, 'rmse': mse.sqrt(),
+            'psnr': -10 * torch.log10(mse.clamp_min(1e-12)),
+            'ssim': ssim_map.mean(dim=(1, 2, 3))}
+
+
 @torch.no_grad()
 def evaluate(model, batches, device, rows, preview_dir=None):
     model.eval()
@@ -89,6 +119,7 @@ def evaluate(model, batches, device, rows, preview_dir=None):
         if not torch.isfinite(recon).all():
             raise ValueError('Nonfinite reconstruction')
         error = recon - images
+        image_metrics = reconstruction_metrics(recon, images)
         for i, index in enumerate(indices.tolist()):
             # Profiles compare mean intensity over time / frequency, preserving axis order.
             record = dict(rows[index])
@@ -96,6 +127,7 @@ def evaluate(model, batches, device, rows, preview_dir=None):
                           frequency_profile_l1=error[i].mean(dim=(0, 2)).abs().mean().item(),
                           temporal_profile_l1=error[i].mean(dim=(0, 1)).abs().mean().item(),
                           clipped_fraction=((recon[i] < 0) | (recon[i] > 1)).float().mean().item())
+            record.update({key: values[i].item() for key, values in image_metrics.items()})
             records.append(record)
             if preview_dir is not None and len(records) <= 16:
                 out = Path(preview_dir)
@@ -108,10 +140,14 @@ def evaluate(model, batches, device, rows, preview_dir=None):
     if not records:
         raise ValueError('Evaluation split is empty')
     patients = sorted({r['patient_id'] for r in records})
-    metrics = ['l1', 'mse', 'frequency_profile_l1', 'temporal_profile_l1', 'clipped_fraction']
+    metrics = ['l1', 'mse', 'rmse', 'ssim', 'psnr', 'frequency_profile_l1', 'temporal_profile_l1', 'clipped_fraction']
     by_patient = {p: {k: float(np.mean([r[k] for r in records if r['patient_id'] == p]))
                       for k in metrics} for p in patients}
-    return {'image_mean': {k: float(np.mean([r[k] for r in records])) for k in metrics},
+    return {'metric_settings': {'data_range': 1.0, 'input': 'unclipped float RGB, no PNG quantization',
+                              'ssim': '11x11 Gaussian sigma=1.5, K1=0.01 K2=0.03, population covariance, valid windows, channel mean',
+                              'psnr': '10*log10(1/max(MSE,1e-12)), dB, capped at 120',
+                              'aggregation': 'per-image metrics; image_mean weights images equally; patient_mean weights patient averages equally'},
+            'image_mean': {k: float(np.mean([r[k] for r in records])) for k in metrics},
             'patient_mean': {k: float(np.mean([v[k] for v in by_patient.values()])) for k in metrics},
             'patients': by_patient, 'samples': records}
 
@@ -248,10 +284,13 @@ def train(args):
         val = metrics['patient_mean']['l1']
         history.append({'epoch': epoch, 'train_l1': total / count,
                         'val_l1': val, 'val_image_l1': metrics['image_mean']['l1'],
-                        'val_mse': metrics['patient_mean']['mse'], 'lr': optimizer.param_groups[0]['lr']})
+                        'val_mse': metrics['patient_mean']['mse'],
+                        'val_rmse': metrics['patient_mean']['rmse'],
+                        'val_ssim': metrics['patient_mean']['ssim'],
+                        'val_psnr': metrics['patient_mean']['psnr'], 'lr': optimizer.param_groups[0]['lr']})
         scheduler.step()
         with (out / 'losses.csv').open('w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=history[0].keys())
+            writer = csv.DictWriter(f, fieldnames=list(dict.fromkeys(key for row in history for key in row)))
             writer.writeheader()
             writer.writerows(history)
         write_loss_plot(history, out / 'epoch_loss_plot.svg')

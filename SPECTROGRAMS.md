@@ -254,3 +254,29 @@ They cover patient-leakage rejection, grayscale validation, exact statistics,
 training/validation plots, checkpoint recovery, frozen encoder identity, cache
 round-trip, bundle reload, decoding, and held-out reporting. They do not establish
 scientific performance or full-model GPU memory requirements.
+
+## Additional reconstruction evaluation metrics
+
+All baseline, epoch validation, and standalone `evaluate` reports now include
+MSE, RMSE, SSIM, and PSNR for each image, each patient, and overall summaries.
+`losses.csv` also records patient-averaged `val_mse`, `val_rmse`, `val_ssim`, and
+`val_psnr`. Training still optimizes L1; checkpoint selection still uses validation
+L1. Existing checkpoints work without retraining; use `evaluate --split val` with
+a new output directory to obtain these metrics for a completed run.
+
+Metrics use unclipped floating-point RGB predictions and targets in the fixed
+original intensity scale (data range 1), before PNG quantization. MSE is mean
+squared pixel error; RMSE is its square root per image. Lower is better. PSNR is
+`10*log10(1/max(MSE,1e-12))` in dB; higher is better, with a 120 dB cap for exact
+or near-exact matches so reports remain finite JSON. SSIM uses 11x11 Gaussian
+windows, sigma 1.5, K1=0.01, K2=0.03, population covariance, valid windows
+(excluding five border pixels), and averages across windows and RGB channels.
+Higher is better; identical images score 1. SSIM assesses overall local structure
+and contrast, but does not by itself prove that specific frequency bands or
+transient events are preserved. Continue inspecting previews and frequency/time
+profile metrics. Each JSON report records the metric settings.
+
+Overall RMSE/PSNR are averages of per-image scores, not metrics recomputed from
+pooled MSE. `image_mean` weights images equally; `patient_mean` weights patient
+averages equally. Test images are read only when test evaluation is requested
+(or cache export is run), not during training validation.

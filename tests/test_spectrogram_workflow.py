@@ -15,11 +15,26 @@ from omegaconf import OmegaConf
 from transformers import (Dinov2WithRegistersConfig, Dinov2WithRegistersModel,
                           ViTMAEConfig, BitImageProcessor)
 from spectrogram_data import ChannelMoments, SpectrogramDataset, prepare_manifest, read_manifest
-from spectrogram_rae import train, export, decode, report
+from spectrogram_rae import train, export, decode, report, reconstruction_metrics
 from stage1 import RAE
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_reconstruction_metrics(self):
+        torch.set_num_threads(1)
+        target = torch.full((2, 3, 32, 32), .5)
+        same = reconstruction_metrics(target, target)
+        torch.testing.assert_close(same['mse'], torch.zeros(2))
+        torch.testing.assert_close(same['rmse'], torch.zeros(2))
+        torch.testing.assert_close(same['ssim'], torch.ones(2), atol=1e-4, rtol=0)
+        torch.testing.assert_close(same['psnr'], torch.full((2,), 120.))
+        changed = reconstruction_metrics(target + .1, target)
+        torch.testing.assert_close(changed['mse'], torch.full((2,), .01))
+        torch.testing.assert_close(changed['rmse'], torch.full((2,), .1))
+        torch.testing.assert_close(changed['psnr'], torch.full((2,), 20.))
+        expected_ssim = (2*.5*.6 + .01**2)/(.5**2 + .6**2 + .01**2)
+        torch.testing.assert_close(changed['ssim'], torch.full((2,), expected_ssim), atol=5e-4, rtol=0)
+
     def test_statistics(self):
         torch.manual_seed(2)
         z = torch.randn(7, 5, 4, 3)
@@ -131,6 +146,10 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(batch_records[0]['global_step'], '1')
             self.assertGreater(float(batch_records[0]['l1']), 0)
             self.assertTrue((run / 'epoch_loss_plot.svg').exists())
+            metrics = json.loads((run / 'validation_metrics.json').read_text())
+            for scope in ('image_mean', 'patient_mean'):
+                for metric in ('mse', 'rmse', 'ssim', 'psnr'):
+                    self.assertTrue(np.isfinite(metrics[scope][metric]))
             handoff = root / 'handoff'
             export(SimpleNamespace(**common, run=str(run), output=str(handoff), manifest=str(manifest)))
             metadata = json.loads((handoff / 'manifest.json').read_text())
