@@ -45,6 +45,44 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'channels differ'):
                 SpectrogramDataset(root, [{'path': 'color.png'}])[0]
 
+    def test_presplit_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split, patient in [('train', 'p1'), ('val', 'p2'), ('test', 'p3')]:
+                folder = root / split / patient / 'channel_01'
+                folder.mkdir(parents=True)
+                for segment in range(2):
+                    Image.new('L', (256, 256), 100).save(folder / f'segment_{segment}.PNG')
+            (root / 'document1.txt').write_text('Unrelated document')
+            documents = root / 'documents'
+            documents.mkdir()
+            Image.new('L', (10, 10)).save(documents / 'illustration.png')
+            rows = prepare_manifest(root, root / 'samples.csv', seed=999)
+            self.assertEqual(len(rows), 6)
+            self.assertEqual({r['patient_id']: r['split'] for r in rows},
+                             {'p1': 'train', 'p2': 'val', 'p3': 'test'})
+            for row in rows:
+                image, _ = SpectrogramDataset(root, [row])[0]
+                self.assertEqual(tuple(image.shape), (3, 256, 256))
+                self.assertEqual(Path(row['path']).parts[0], row['split'])
+            duplicate = root / 'test' / 'p1'
+            duplicate.mkdir()
+            Image.new('L', (256, 256)).save(duplicate / 'image.png')
+            with self.assertRaisesRegex(ValueError, 'Patient leakage'):
+                prepare_manifest(root, root / 'invalid.csv')
+            self.assertFalse((root / 'invalid.csv').exists())
+
+    def test_incomplete_presplit_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'train').mkdir()
+            with self.assertRaisesRegex(ValueError, 'requires train, val, and test'):
+                prepare_manifest(root, root / 'invalid.csv')
+            (root / 'val').mkdir()
+            (root / 'test').mkdir()
+            with self.assertRaisesRegex(ValueError, 'No PNG images'):
+                prepare_manifest(root, root / 'invalid.csv')
+
     def test_complete_offline_workflow(self):
         torch.set_num_threads(1)
         torch.manual_seed(3)
@@ -52,7 +90,7 @@ class WorkflowTests(unittest.TestCase):
             root = Path(directory)
             data = root / 'data'
             for i in range(3):
-                patient = data / f'patient_{i}'
+                patient = data / ('train', 'val', 'test')[i] / f'patient_{i}'
                 patient.mkdir(parents=True)
                 image = np.random.default_rng(i).integers(0, 256, (256, 256), dtype=np.uint8)
                 Image.fromarray(image).convert('RGB').save(patient / 'channel_segment.png')

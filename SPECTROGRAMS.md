@@ -16,29 +16,52 @@ DINO input normalization. Time/frequency orientation and the original dB mapping
 remain as supplied. Bicubic resizing can slightly overshoot the input range,
 consistent with the authors' wrapper.
 
-Arrange images as:
+For an already split dataset, arrange images as:
 
 ```text
 /path/to/spectrograms/
-  patient_001/
-    channel_01/segment_000.png
-    channel_02/segment_000.png
-  patient_002/
-    ...
+  train/
+    patient_008/
+      channel_01/segment_000.png
+      channel_01/segment_001.png
+      channel_02/segment_000.png
+  val/
+    patient_0059/
+      channel_01/segment_000.png
+  test/
+    patient_001/
+      channel_01/segment_000.png
+  document1.txt
 ```
 
-The first directory under the dataset root is the patient ID. Use the same ID for
-all recordings belonging to that patient. Do not place role/split directories
-above patients. Exclude any patients or recordings you judge unsuitable before
-preparing the manifest.
+`prepare` automatically recognizes split folders and **preserves your existing
+assignments**. Patient IDs are the directory names immediately below each split.
+All channels and two-minute segments of a patient must belong to one split.
+Only PNGs under `train/`, `val/`, and `test/` are scanned; unrelated documents and
+folders outside these split directories are ignored. `.png` and `.PNG` are both
+accepted. Each split must contain at least one image. A patient appearing in
+multiple splits is rejected before the manifest is written. Use consistent IDs
+for the same patient: differently named aliases cannot be detected automatically.
 
-The generated split is approximately 70% train, 15% validation, 15% test **by
-patient count**, with at least one patient in each held-out split (minimum three
-patients total). Small datasets therefore have different proportions. Assignment
-uses a reproducible seed-dependent hash ordering. Freeze the CSV once prepared;
-regenerating it after adding patients can change assignments. For a larger study,
-review diagnosis/site distributions and explicitly edit the patient-level split
-before training. Leakage checks reject patients assigned to multiple splits.
+Use `--layout presplit` to explicitly require this structure; missing or empty
+split directories cause an error. `--seed` has no effect on existing splits.
+Manifest paths retain the split prefix, such as
+`train/patient_008/channel_01/segment_000.png`. Keep `--data-root` pointing to the
+parent directory containing all three splits for prepare, train, export, and
+evaluate. Training and export read the CSV, so they need no layout changes.
+
+The earlier `DATA_ROOT/patient_id/channel/segment.png` layout is also supported.
+When no split directory exists, automatic preparation assigns approximately
+70% train, 15% validation, and 15% test by patient count, with at least one patient
+in each held-out split and a minimum of three patients. Small datasets have
+different proportions. Assignment uses a reproducible seed-dependent hash order.
+Use `--layout patient-folders` to select this older layout explicitly. If any
+split directory is detected in automatic mode, all three are required to avoid
+accidentally reassigning a partially prepared dataset.
+
+Freeze the CSV after preparation. Use a new manifest and training output directory
+for your smaller subset; do not resume a run trained with the original dataset.
+The existing `--resume` checks require the original manifest and dataset root.
 
 You can instead supply your own CSV with columns `path,patient_id,split,role`.
 Paths are relative to the dataset root. Split is `train`, `val`, or `test`; `role`
@@ -79,7 +102,7 @@ new run. Training uses one GPU; choose a device such as `cuda:1` if needed.
 ```bash
 python src/spectrogram_rae.py prepare \
   --data-root /path/to/spectrograms \
-  --manifest /path/to/experiment/samples.csv --seed 42
+  --manifest /path/to/experiment/samples.csv --layout presplit
 
 python src/spectrogram_rae.py train \
   --config configs/stage1/training/spectrogram.yaml \

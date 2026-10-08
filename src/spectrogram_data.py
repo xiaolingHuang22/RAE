@@ -38,32 +38,63 @@ def read_manifest(path):
     return rows
 
 
-def prepare_manifest(root, output, seed=42):
+def prepare_manifest(root, output, seed=42, layout='auto'):
+    """Preserve existing split folders, or assign splits to patient-root datasets."""
     root, output = Path(root), Path(output)
-    paths = sorted(root.rglob('*.png'))
-    if not paths:
-        raise ValueError('No PNG images found')
-    if any(len(p.relative_to(root).parts) < 2 for p in paths):
-        raise ValueError('Expected DATA_ROOT/patient_id/[optional subfolders]/image.png')
-    patients = sorted({p.relative_to(root).parts[0] for p in paths})
-    if len(patients) < 3:
-        raise ValueError('At least three patients are required for train/val/test')
-    # Hash ordering is reproducible without depending on random library versions.
-    patients.sort(key=lambda p: hashlib.sha256(f'{seed}:{p}'.encode()).hexdigest())
-    n = len(patients)
-    n_val = max(1, round(n * .15))
-    n_test = max(1, round(n * .15))
-    splits = {p: ('val' if i < n_val else 'test' if i < n_val + n_test else 'train')
-              for i, p in enumerate(patients)}
+    split_names = ('train', 'val', 'test')
+    if layout not in {'auto', 'presplit', 'patient-folders'}:
+        raise ValueError('Unknown dataset layout')
+    present = [name for name in split_names if (root / name).is_dir()]
+    if layout == 'auto':
+        layout = 'presplit' if present else 'patient-folders'
+    rows = []
+
+    def pngs(folder):
+        return sorted(p for p in folder.rglob('*')
+                      if p.is_file() and p.suffix.lower() == '.png')
+
+    if layout == 'presplit':
+        if len(present) != 3:
+            raise ValueError('Presplit layout requires train, val, and test directories')
+        patients = {}
+        # Only scan these directories: root-level documents and other folders are ignored.
+        for split in split_names:
+            paths = pngs(root / split)
+            if not paths:
+                raise ValueError(f'No PNG images found in {split} split')
+            for path in paths:
+                rel = path.relative_to(root)
+                if len(rel.parts) < 3:
+                    raise ValueError('Expected DATA_ROOT/split/patient_id/[optional subfolders]/image.png')
+                patient = rel.parts[1]
+                previous = patients.setdefault(patient, split)
+                if previous != split:
+                    raise ValueError(f'Patient leakage: {patient} appears in {previous} and {split}')
+                rows.append(dict(path=rel.as_posix(), patient_id=patient, split=split, role='target'))
+    else:
+        paths = pngs(root)
+        if not paths:
+            raise ValueError('No PNG images found')
+        if any(len(p.relative_to(root).parts) < 2 for p in paths):
+            raise ValueError('Expected DATA_ROOT/patient_id/[optional subfolders]/image.png')
+        patients = sorted({p.relative_to(root).parts[0] for p in paths})
+        if len(patients) < 3:
+            raise ValueError('At least three patients are required for train/val/test')
+        patients.sort(key=lambda p: hashlib.sha256(f'{seed}:{p}'.encode()).hexdigest())
+        n_val = max(1, round(len(patients) * .15))
+        n_test = max(1, round(len(patients) * .15))
+        splits = {p: ('val' if i < n_val else 'test' if i < n_val + n_test else 'train')
+                  for i, p in enumerate(patients)}
+        for path in paths:
+            rel = path.relative_to(root)
+            patient = rel.parts[0]
+            rows.append(dict(path=rel.as_posix(), patient_id=patient, split=splits[patient], role='target'))
+    # Validate all assignments before creating the CSV.
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['path', 'patient_id', 'split', 'role'])
         writer.writeheader()
-        for path in paths:
-            rel = path.relative_to(root)
-            patient = rel.parts[0]
-            writer.writerow(dict(path=rel.as_posix(), patient_id=patient,
-                                 split=splits[patient], role='target'))
+        writer.writerows(rows)
     return read_manifest(output)
 
 

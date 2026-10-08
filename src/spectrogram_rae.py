@@ -402,6 +402,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('prepare')
+    p.add_argument('--layout', choices=['auto', 'presplit', 'patient-folders'], default='auto',
+                   help='Auto preserves existing train/val/test folders; presplit requires them')
     p.add_argument('--data-root', required=True)
     p.add_argument('--manifest', required=True)
     p.add_argument('--seed', type=int, default=42)
@@ -437,7 +439,7 @@ def main():
     if args.command == 'train' and (args.epochs < 1 or args.lr <= 0 or args.log_every < 1):
         parser.error('epochs, lr, and log-every must be positive')
     if args.command == 'prepare':
-        rows = prepare_manifest(args.data_root, args.manifest, args.seed)
+        rows = prepare_manifest(args.data_root, args.manifest, args.seed, args.layout)
         print(f'Wrote {len(rows)} records to {args.manifest}')
     else:
         {'train': train, 'export': export, 'decode': decode, 'evaluate': report}[args.command](args)
