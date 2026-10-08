@@ -178,3 +178,51 @@ def write_loss_plot(history, path):
         parts.append(f'<text x="{label_x}" y="25" fill="{color}">{label}</text>')
     parts += ['<text x="400" y="430">Epoch</text>', '</g></svg>']
     Path(path).write_text('\n'.join(parts))
+
+
+def write_batch_loss_plot(batches, epochs, path, steps_per_epoch):
+    """Plot raw batch losses and epoch validation at their global batch steps.
+
+    Keep CSV data complete; use min/max buckets to bound SVG size while retaining
+    visible spikes for long runs.
+    """
+    if not batches:
+        return
+    points = [(r['global_step'], r['l1']) for r in batches]
+    if len(points) > 1400:
+        bucket_size = (len(points) + 699) // 700
+        reduced = []
+        for start in range(0, len(points), bucket_size):
+            bucket = points[start:start + bucket_size]
+            reduced.extend(sorted({min(bucket, key=lambda p: p[1]),
+                                   max(bucket, key=lambda p: p[1])}))
+        points = [points[0], *reduced, points[-1]]
+    validation = [(r['epoch'] * steps_per_epoch, r['val_l1']) for r in epochs]
+    xmax = max(1, batches[-1]['global_step'])
+    ymax = max([p[1] for p in points + validation] + [1e-8]) * 1.1
+    def coordinate(point):
+        x, y = point
+        return 85 + x / xmax * 675, 370 - y / ymax * 325
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440">',
+             '<rect width="100%" height="100%" fill="white"/>',
+             '<g font-family="sans-serif" font-size="13" fill="#222">',
+             '<text x="85" y="25">Reconstruction L1 by batch step</text>',
+             '<text x="445" y="25" fill="#2563eb">Training batch</text>',
+             '<text x="590" y="25" fill="#e45b20">Validation (epoch)</text>']
+    for i in range(6):
+        y = 370 - i * 65
+        x = 85 + i * 135
+        parts += [f'<path d="M85,{y} H760" stroke="#ddd"/>',
+                  f'<text x="10" y="{y+5}">{ymax*i/5:.5f}</text>',
+                  f'<text x="{x}" y="395" text-anchor="middle">{round(xmax*i/5)}</text>']
+    for series, color in [(points, '#2563eb'), (validation, '#e45b20')]:
+        coords = [coordinate(p) for p in series]
+        joined = ' '.join(f'{x:.2f},{y:.2f}' for x,y in coords)
+        parts.append(f'<polyline points="{joined}" fill="none" stroke="{color}" stroke-width="1.5"/>')
+        if color == '#e45b20' or len(coords) == 1:
+            parts.extend(f'<circle cx="{x}" cy="{y}" r="3" fill="{color}"/>' for x,y in coords)
+    parts += ['<text x="345" y="430">Global training batch step</text>', '</g></svg>']
+    destination = Path(path)
+    temporary = destination.with_suffix('.tmp')
+    temporary.write_text('\n'.join(parts))
+    temporary.replace(destination)

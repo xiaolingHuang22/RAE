@@ -21,7 +21,7 @@ from transformers import AutoImageProcessor, AutoConfig
 from huggingface_hub import snapshot_download
 
 from spectrogram_data import (SpectrogramDataset, ChannelMoments, read_manifest,
-                              prepare_manifest, write_loss_plot)
+                              prepare_manifest, write_loss_plot, write_batch_loss_plot)
 from stage1 import RAE
 
 
@@ -198,27 +198,51 @@ def train(args):
     else:
         baseline = evaluate(model, val_batches, device, validation, out / 'baseline')
         save_json(out / 'baseline_metrics.json', baseline)
+    batch_path = out / 'batch_losses.csv'
+    batch_history = []
+    if args.resume and batch_path.exists():
+        with batch_path.open(newline='') as f:
+            for row in csv.DictReader(f):
+                if int(row['epoch']) < first_epoch:
+                    batch_history.append({key: (int(value) if key in ('epoch', 'batch', 'global_step')
+                                                else float(value)) for key, value in row.items()})
+    batch_fields = ['epoch', 'batch', 'global_step', 'l1', 'lr']
+    # Remove any interrupted epoch's rows before repeating that epoch on resume.
+    with batch_path.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=batch_fields)
+        writer.writeheader()
+        writer.writerows(batch_history)
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         model.encoder.eval()
         total, count = 0., 0
-        for step, (images, _) in enumerate(batches, 1):
-            images = images.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with amp_context(device, args.precision):
-                recon = model(images)
-                loss = (recon.float() - images).abs().mean()
-            if not torch.isfinite(loss):
-                raise ValueError('Nonfinite training loss')
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.)
-            scaler.step(optimizer)
-            scaler.update()
-            total += loss.item() * len(images)
-            count += len(images)
-            if step % args.log_every == 0:
-                print(f'Epoch {epoch} batch {step}/{len(batches)} L1={loss.item():.6f}', flush=True)
+        with batch_path.open('a', newline='') as batch_file:
+            batch_writer = csv.DictWriter(batch_file, fieldnames=batch_fields)
+            for step, (images, _) in enumerate(batches, 1):
+                images = images.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with amp_context(device, args.precision):
+                    recon = model(images)
+                    loss = (recon.float() - images).abs().mean()
+                if not torch.isfinite(loss):
+                    raise ValueError('Nonfinite training loss')
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.)
+                scaler.step(optimizer)
+                scaler.update()
+                total += loss.item() * len(images)
+                count += len(images)
+                global_step = (epoch - 1) * len(batches) + step
+                batch_row = {'epoch': epoch, 'batch': step, 'global_step': global_step,
+                             'l1': loss.item(), 'lr': optimizer.param_groups[0]['lr']}
+                batch_writer.writerow(batch_row)
+                batch_file.flush()
+                batch_history.append(batch_row)
+                if global_step == 1 or global_step % getattr(args, 'plot_every', 200) == 0:
+                    write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
+                if step % args.log_every == 0:
+                    print(f'Epoch {epoch} batch {step}/{len(batches)} L1={loss.item():.6f}', flush=True)
         metrics = evaluate(model, val_batches, device, validation)
         # Patient weighting avoids allowing patients with many channels to dominate selection.
         val = metrics['patient_mean']['l1']
@@ -230,7 +254,8 @@ def train(args):
             writer = csv.DictWriter(f, fieldnames=history[0].keys())
             writer.writeheader()
             writer.writerows(history)
-        write_loss_plot(history, out / 'loss_plot.svg')
+        write_loss_plot(history, out / 'epoch_loss_plot.svg')
+        write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
         if val < best:
             best = val
             torch.save(model.decoder.state_dict(), out / 'best_decoder.pt')
@@ -290,6 +315,9 @@ def export(args):
     shutil.copyfile(args.manifest, out / 'samples.csv')
     for name in ('baseline_metrics.json', 'validation_metrics.json', 'losses.csv', 'loss_plot.svg'):
         shutil.copyfile(run / name, out / name)
+    for name in ('batch_losses.csv', 'epoch_loss_plot.svg'):
+        if (run / name).exists():
+            shutil.copyfile(run / name, out / name)
     src = Path(__file__).resolve().parent
     shutil.copytree(src / 'stage1', out / 'runtime' / 'stage1', ignore=shutil.ignore_patterns('__pycache__'))
     for name in ('spectrogram_data.py', 'spectrogram_rae.py'):
@@ -418,11 +446,12 @@ def main():
             p.add_argument('--manifest', required=True)
         if command == 'train':
             p.add_argument('--config', default='configs/stage1/training/spectrogram.yaml')
-            p.add_argument('--epochs', type=int, default=30)
+            p.add_argument('--epochs', type=int, default=10)
             p.add_argument('--lr', type=float, default=2e-5)
             p.add_argument('--seed', type=int, default=42)
             p.add_argument('--precision', choices=['fp32','fp16','bf16'], default='fp32')
             p.add_argument('--log-every', type=int, default=20)
+            p.add_argument('--plot-every', type=int, default=200, help='Refresh batch SVG every N batches; CSV records every batch')
             p.add_argument('--resume', action='store_true', help='Resume last completed epoch with unchanged settings')
         else:
             p.add_argument('--run', required=True)
@@ -436,8 +465,8 @@ def main():
     args = parser.parse_args()
     if hasattr(args, 'batch_size') and args.batch_size < 1:
         parser.error('--batch-size must be positive')
-    if args.command == 'train' and (args.epochs < 1 or args.lr <= 0 or args.log_every < 1):
-        parser.error('epochs, lr, and log-every must be positive')
+    if args.command == 'train' and (args.epochs < 1 or args.lr <= 0 or args.log_every < 1 or args.plot_every < 1):
+        parser.error('epochs, lr, log-every, and plot-every must be positive')
     if args.command == 'prepare':
         rows = prepare_manifest(args.data_root, args.manifest, args.seed, args.layout)
         print(f'Wrote {len(rows)} records to {args.manifest}')

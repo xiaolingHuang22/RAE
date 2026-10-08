@@ -123,7 +123,14 @@ class WorkflowTests(unittest.TestCase):
             train(SimpleNamespace(**common, output=str(run), config=str(config), manifest=str(manifest),
                                   epochs=1, lr=2e-5, seed=42, precision='fp32', log_every=1, resume=True))
             self.assertTrue((run / 'loss_plot.svg').exists())
-            self.assertIn('Validation', (run / 'loss_plot.svg').read_text())
+            self.assertIn('Validation (epoch)', (run / 'loss_plot.svg').read_text())
+            self.assertIn('Global training batch step', (run / 'loss_plot.svg').read_text())
+            with (run / 'batch_losses.csv').open(newline='') as f:
+                batch_records = list(csv.DictReader(f))
+            self.assertEqual(len(batch_records), 1)
+            self.assertEqual(batch_records[0]['global_step'], '1')
+            self.assertGreater(float(batch_records[0]['l1']), 0)
+            self.assertTrue((run / 'epoch_loss_plot.svg').exists())
             handoff = root / 'handoff'
             export(SimpleNamespace(**common, run=str(run), output=str(handoff), manifest=str(manifest)))
             metadata = json.loads((handoff / 'manifest.json').read_text())

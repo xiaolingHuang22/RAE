@@ -109,7 +109,7 @@ python src/spectrogram_rae.py train \
   --data-root /path/to/spectrograms \
   --manifest /path/to/experiment/samples.csv \
   --output /path/to/experiment/run \
-  --batch-size 4 --epochs 30 --lr 2e-5 --precision bf16 --device cuda
+  --batch-size 4 --epochs 10 --lr 2e-5 --precision bf16 --device cuda
 ```
 
 These are starting settings, not scientifically validated hyperparameters. Use
@@ -123,7 +123,9 @@ decoder weights. CPU execution is supported for small verification models.
 Training first evaluates the pretrained decoder on validation patients. Every
 completed epoch then evaluates the current decoder in fp32 and updates:
 
-- `loss_plot.svg`: training and validation L1 on the same plot, viewable in a browser.
+- `loss_plot.svg`: training batch L1 against global batch step, with validation L1 points after each epoch. Refreshed every 200 batches and after validation.
+- `batch_losses.csv`: every batch's epoch, within-epoch batch, global step, L1, and learning rate; flushed after each batch.
+- `epoch_loss_plot.svg`: the original epoch-level training/validation plot.
 - `losses.csv`: exact epoch metrics and learning rate for plotting elsewhere.
 - `best_decoder.pt`: native decoder state dict with lowest patient-averaged validation L1.
 - `best_validation.json`: metrics and selected epoch.
@@ -136,13 +138,21 @@ Training L1 is image-weighted over optimization batches; validation L1 on the pl
 is patient-weighted, so patients with many channels do not dominate checkpoint
 selection. `val_image_l1` is also in the CSV for a directly image-weighted comparison.
 Training losses are measured during optimization; validation uses the end-of-epoch
-weights. The plot is refreshed after validation each epoch, while batch losses
-are printed during training. It can be refreshed in a browser while the run is
-active.
+weights. L1 is calculated on every batch, not only on printed batches. `--log-every 20`
+prints the current batch loss every 20 batches; it is not a 20-batch average.
+The CSV records every batch regardless of printing frequency. `--plot-every 200`
+controls plot refresh frequency and can be lowered to 20. Validation still runs
+once per epoch; its points are placed at the corresponding end-of-epoch global
+batch steps. Long curves use min/max buckets to limit SVG size while preserving
+spikes; every original value remains in the CSV. The plot can be refreshed in a
+browser while training is active. The default duration is 10 epochs; an explicit
+`--epochs 30` still overrides that default. Changes do not affect an already
+running process. Start a new output directory for a new 10-epoch experiment.
 
 To recover from an interruption, repeat the exact training command with
 `--resume`. It resumes at the next epoch after `last_training.pt`; partial epoch
-work is repeated. Dataset root, manifest, epochs, LR, seed, precision, and batch
+work is repeated, and batch CSV rows from that incomplete epoch are removed
+before it is retrained. Dataset root, manifest, epochs, LR, seed, precision, and batch
 size must match. Keep the original images unchanged. Recovery is not a guarantee
 of bitwise reproducibility across GPU/software versions.
 
