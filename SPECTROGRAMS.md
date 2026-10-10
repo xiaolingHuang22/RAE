@@ -448,3 +448,66 @@ If image reconstruction improves but the downstream model does not, investigate
 encoder features and conditional generation separately. Decoder-only training
 leaves the frozen DINO features unchanged. Changes in reconstructions therefore
 do not mean the cached encoder representation has become more SEEG-specific.
+
+## Wider plots and a zoomed view of late training
+
+Training plots now default to 1600 pixels wide. Add `--plot-width 2400` (or larger)
+to `train` to stretch the horizontal axis further. Minimum width is 1000.
+The full `loss_plot.svg` and `objective_plot.svg` retain all training steps and
+a zero-based Y axis. Additional `loss_plot_zoom.svg` and `objective_plot_zoom.svg`
+exclude the first 200 batches by default and automatically tighten the Y range.
+Their titles explicitly identify the skipped steps and nonzero Y axis. Set
+`--plot-zoom-start 2000` to focus on later training. These settings only affect
+visualization: all losses stay recorded, and checkpoint selection is unchanged.
+SVG viewers may fit large images to the window; view at actual size/zoom in and
+scroll horizontally to benefit from the added width.
+
+You can redraw an existing run without training or loading model weights:
+
+```bash
+python src/spectrogram_rae.py plot \
+  --run exps/structure_loss_01/runs \
+  --plot-width 2400 --plot-zoom-start 2000
+```
+
+This reads `batch_losses.csv` and `losses.csv` and replaces only the batch SVG
+plots in that run. It does not change metrics, samples, or checkpoints. It needs
+the local completed-run CSVs; do not regenerate plots in the same folder while
+training is writing them. An early run with fewer steps than the zoom start has
+no zoom plot until enough steps exist. Plots still use min/max buckets, with a
+larger point budget for wider plots; the CSV retains every original batch value.
+
+### Controlled next experiment: initial learning rate 5e-5
+
+The suggested next run changes only the learning rate, preserving the current
+structure-loss weights, initialization, seed, batch size, and 10-epoch duration.
+The general default learning rate remains 2e-5 so existing experiments retain
+their behavior. From the repository root:
+
+```bash
+python src/spectrogram_rae.py train \
+  --config configs/stage1/training/spectrogram.yaml \
+  --data-root ~/RAE_first_exp \
+  --manifest first_exp_runs/subset_samples.csv \
+  --output exps/structure_loss_lr5e5/runs \
+  --epochs 10 --batch-size 4 --lr 5e-5 --seed 42 \
+  --precision bf16 --device cuda:0 \
+  --loss spectrogram \
+  --ssim-weight 0.1 --gradient-weight 0.2 --profile-weight 0.1 \
+  --plot-width 2400 --plot-zoom-start 2000
+```
+
+The seed flag is `--seed`, not `--global-seed`. Use a new output directory and
+the same pretrained decoder configuration. Compare best validation objectives,
+SSIM, PSNR, L1, gradient errors, and matched previews against the previous run.
+Keep test patients reserved. A higher learning rate is an experiment, not a
+promised fix for smoothing. If training improves without validation improvement,
+use a controlled loss ablation next rather than further increasing the LR.
+
+The new batch plots also overlay a 200-batch trailing arithmetic mean in dark
+teal; raw batch values appear in translucent blue, and validation in orange.
+The first mean values use fewer than 200 samples. In a zoom plot the mean is
+computed from the displayed interval, excluding the omitted early steps. All
+raw CSV values are retained. Wider plots have a larger rendering point budget.
+Averaging is for visualization only and does not affect the optimization or
+checkpoint selection. Epoch summaries remain unchanged.

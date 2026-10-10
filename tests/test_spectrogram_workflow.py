@@ -14,8 +14,8 @@ from PIL import Image
 from omegaconf import OmegaConf
 from transformers import (Dinov2WithRegistersConfig, Dinov2WithRegistersModel,
                           ViTMAEConfig, BitImageProcessor)
-from spectrogram_data import ChannelMoments, SpectrogramDataset, prepare_manifest, read_manifest
-from spectrogram_rae import train, export, decode, report, reconstruction_metrics, training_objective
+from spectrogram_data import ChannelMoments, SpectrogramDataset, prepare_manifest, read_manifest, write_batch_loss_plot
+from spectrogram_rae import train, export, decode, report, reconstruction_metrics, training_objective, replot
 from stage1 import RAE
 
 
@@ -49,6 +49,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(abs(identity.item()), 1e-5)
         l1, _ = training_objective(prediction, target, dict(mode='l1'))
         torch.testing.assert_close(l1, (prediction-target).abs().mean())
+
+    def test_wide_zoom_plot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'zoom.svg'
+            batches = [{'global_step': i, 'l1': .03 + .001*(i % 5)} for i in range(1, 301)]
+            epochs = [{'epoch': 1, 'val_l1': .033}, {'epoch': 2, 'val_l1': .032}]
+            write_batch_loss_plot(batches, epochs, path, 150, width=2400, start_step=200, zoom=True)
+            svg = path.read_text()
+            self.assertIn('width="2400"', svg)
+            self.assertIn('steps 200 onwards', svg)
+            self.assertIn('nonzero Y axis', svg)
+            self.assertIn('Training trailing mean (200 batches)', svg)
+            root = Path(directory)
+            with (root / 'batch_losses.csv').open('w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['global_step', 'batch', 'l1'])
+                writer.writeheader()
+                writer.writerows({**b, 'batch': (b['global_step']-1)%150+1} for b in batches)
+            with (root / 'losses.csv').open('w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['epoch', 'val_l1'])
+                writer.writeheader()
+                writer.writerows(epochs)
+            replot(SimpleNamespace(run=str(root), plot_width=2400, plot_zoom_start=200))
+            self.assertTrue((root / 'loss_plot_zoom.svg').exists())
+            self.assertIn('width="2400"', (root / 'loss_plot.svg').read_text())
+            self.assertNotIn('>0.00000<', svg)
 
     def test_statistics(self):
         torch.manual_seed(2)

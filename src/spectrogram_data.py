@@ -180,7 +180,7 @@ def write_loss_plot(history, path):
     Path(path).write_text('\n'.join(parts))
 
 
-def write_batch_loss_plot(batches, epochs, path, steps_per_epoch, objective=False):
+def write_batch_loss_plot(batches, epochs, path, steps_per_epoch, objective=False, width=1600, start_step=0, zoom=False):
     """Plot raw batch losses and epoch validation at their global batch steps.
 
     Keep CSV data complete; use min/max buckets to bound SVG size while retaining
@@ -188,41 +188,68 @@ def write_batch_loss_plot(batches, epochs, path, steps_per_epoch, objective=Fals
     """
     if not batches:
         return
-    points = [(r['global_step'], r['loss' if objective else 'l1']) for r in batches]
-    if len(points) > 1400:
-        bucket_size = (len(points) + 699) // 700
+    points = [(r['global_step'], r['loss' if objective else 'l1']) for r in batches
+              if r['global_step'] >= start_step]
+    if not points:
+        return
+    # Trailing mean is computed from every original batch, before display reduction.
+    raw_values = np.asarray([p[1] for p in points], dtype=np.float64)
+    cumulative = np.concatenate(([0.], np.cumsum(raw_values)))
+    end = np.arange(1, len(points) + 1)
+    begin = np.maximum(0, end - 200)
+    averages = (cumulative[end] - cumulative[begin]) / (end - begin)
+    stride = max(1, len(points) // width)
+    smooth_indices = sorted(set(range(0, len(points), stride)) | {len(points)-1})
+    smoothed = [(points[i][0], float(averages[i])) for i in smooth_indices]
+    point_budget = max(1400, width * 2)
+    if len(points) > point_budget:
+        buckets = point_budget // 2
+        bucket_size = (len(points) + buckets - 1) // buckets
         reduced = []
         for start in range(0, len(points), bucket_size):
             bucket = points[start:start + bucket_size]
             reduced.extend(sorted({min(bucket, key=lambda p: p[1]),
                                    max(bucket, key=lambda p: p[1])}))
         points = [points[0], *reduced, points[-1]]
-    validation = [(r['epoch'] * steps_per_epoch, r['val_loss' if objective else 'val_l1']) for r in epochs]
+    validation = [(r['epoch'] * steps_per_epoch, r['val_loss' if objective else 'val_l1']) for r in epochs if r['epoch'] * steps_per_epoch >= start_step]
     xmax = max(1, batches[-1]['global_step'])
-    ymax = max([p[1] for p in points + validation] + [1e-8]) * 1.1
+    values = [p[1] for p in points + validation]
+    ymin = min(values) if zoom else 0.
+    ymax = max(max(values), ymin + 1e-8)
+    margin = (ymax-ymin)*.1
+    ymax += margin
+    if zoom:
+        ymin -= margin
+    xmin = points[0][0] if zoom else 0
+    span = width - 125
     def coordinate(point):
         x, y = point
-        return 85 + x / xmax * 675, 370 - y / ymax * 325
+        return 85 + (x-xmin) / max(1, xmax-xmin) * span, 370 - (y-ymin) / (ymax-ymin) * 305
     title = 'Composite reconstruction objective' if objective else 'Reconstruction L1 by batch step'
-    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440">',
+    if zoom:
+        title += f' (zoom: steps {xmin} onwards; nonzero Y axis)'
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="440">',
              '<rect width="100%" height="100%" fill="white"/>',
              '<g font-family="sans-serif" font-size="13" fill="#222">',
              f'<text x="85" y="25">{title}</text>',
-             '<text x="445" y="25" fill="#2563eb">Training batch</text>',
-             '<text x="590" y="25" fill="#e45b20">Validation (epoch)</text>']
+             '<text x="85" y="45" fill="#2563eb">Training batch (raw)</text>',
+             '<text x="290" y="45" fill="#164e63">Training trailing mean (200 batches)</text>',
+             f'<text x="{width-210}" y="45" fill="#e45b20">Validation (epoch)</text>']
     for i in range(6):
-        y = 370 - i * 65
-        x = 85 + i * 135
-        parts += [f'<path d="M85,{y} H760" stroke="#ddd"/>',
-                  f'<text x="10" y="{y+5}">{ymax*i/5:.5f}</text>',
-                  f'<text x="{x}" y="395" text-anchor="middle">{round(xmax*i/5)}</text>']
-    for series, color in [(points, '#2563eb'), (validation, '#e45b20')]:
+        y = 370 - i * 61
+        x = 85 + i / 5 * span
+        parts += [f'<path d="M85,{y} H{width-40}" stroke="#ddd"/>',
+                  f'<text x="10" y="{y+5}">{ymin+(ymax-ymin)*i/5:.5f}</text>',
+                  f'<text x="{x}" y="395" text-anchor="middle">{round(xmin+(xmax-xmin)*i/5)}</text>']
+    for series, color in [(points, '#2563eb'), (smoothed, '#164e63'), (validation, '#e45b20')]:
         coords = [coordinate(p) for p in series]
         joined = ' '.join(f'{x:.2f},{y:.2f}' for x,y in coords)
-        parts.append(f'<polyline points="{joined}" fill="none" stroke="{color}" stroke-width="1.5"/>')
+        opacity = .3 if color == '#2563eb' else 1
+        thickness = 1 if color == '#2563eb' else 2
+        parts.append(f'<polyline points="{joined}" fill="none" stroke="{color}" stroke-width="{thickness}" opacity="{opacity}"/>')
         if color == '#e45b20' or len(coords) == 1:
             parts.extend(f'<circle cx="{x}" cy="{y}" r="3" fill="{color}"/>' for x,y in coords)
-    parts += ['<text x="345" y="430">Global training batch step</text>', '</g></svg>']
+    parts += [f'<text x="{width/2-100}" y="430">Global training batch step</text>', '</g></svg>']
     destination = Path(path)
     temporary = destination.with_suffix('.tmp')
     temporary.write_text('\n'.join(parts))

@@ -192,6 +192,32 @@ def evaluate(model, batches, device, rows, preview_dir=None):
             'patients': by_patient, 'samples': records}
 
 
+def update_training_plots(batches, epochs, out, steps_per_epoch, args, composite):
+    width = getattr(args, 'plot_width', 1600)
+    start = getattr(args, 'plot_zoom_start', 200)
+    for objective, name in [(False, 'loss_plot'), (True, 'objective_plot')]:
+        if objective and not composite:
+            continue
+        write_batch_loss_plot(batches, epochs, out / f'{name}.svg', steps_per_epoch,
+                              objective=objective, width=width)
+        write_batch_loss_plot(batches, epochs, out / f'{name}_zoom.svg', steps_per_epoch,
+                              objective=objective, width=width, start_step=start, zoom=True)
+
+
+def replot(args):
+    run = Path(args.run)
+    def records(path):
+        with path.open(newline='') as f:
+            return [{k: float(v) for k, v in row.items() if v != ''} for row in csv.DictReader(f)]
+    batches = records(run / 'batch_losses.csv')
+    epochs = records(run / 'losses.csv')
+    if not batches:
+        raise ValueError('No batch losses recorded')
+    composite = all('loss' in b for b in batches) and all('val_loss' in e for e in epochs)
+    update_training_plots(batches, epochs, run, int(max(b['batch'] for b in batches)), args, composite)
+    print(f'Regenerated SVG plots in {run}; metrics and checkpoints unchanged')
+
+
 def train(args):
     settings = loss_settings(args)
     out = Path(args.output)
@@ -324,9 +350,7 @@ def train(args):
                 batch_file.flush()
                 batch_history.append(batch_row)
                 if global_step == 1 or global_step % getattr(args, 'plot_every', 200) == 0:
-                    write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
-                    if settings['mode'] == 'spectrogram':
-                        write_batch_loss_plot(batch_history, history, out / 'objective_plot.svg', len(batches), objective=True)
+                    update_training_plots(batch_history, history, out, len(batches), args, settings['mode'] == 'spectrogram')
                 if step % args.log_every == 0:
                     print(f'Epoch {epoch} batch {step}/{len(batches)} L1={components["l1"].item():.6f} loss={loss.item():.6f}', flush=True)
         metrics = evaluate(model, val_batches, device, validation)
@@ -344,9 +368,7 @@ def train(args):
             writer.writeheader()
             writer.writerows(history)
         write_loss_plot(history, out / 'epoch_loss_plot.svg')
-        write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
-        if settings['mode'] == 'spectrogram':
-            write_batch_loss_plot(batch_history, history, out / 'objective_plot.svg', len(batches), objective=True)
+        update_training_plots(batch_history, history, out, len(batches), args, settings['mode'] == 'spectrogram')
         if val < best:
             best = val
             torch.save(model.decoder.state_dict(), out / 'best_decoder.pt')
@@ -406,7 +428,7 @@ def export(args):
     shutil.copyfile(args.manifest, out / 'samples.csv')
     for name in ('baseline_metrics.json', 'validation_metrics.json', 'losses.csv', 'loss_plot.svg'):
         shutil.copyfile(run / name, out / name)
-    for name in ('batch_losses.csv', 'epoch_loss_plot.svg', 'objective_plot.svg'):
+    for name in ('batch_losses.csv', 'epoch_loss_plot.svg', 'objective_plot.svg', 'loss_plot_zoom.svg', 'objective_plot_zoom.svg'):
         if (run / name).exists():
             shutil.copyfile(run / name, out / name)
     src = Path(__file__).resolve().parent
@@ -567,6 +589,8 @@ def main():
             p.add_argument('--config', default='configs/stage1/training/spectrogram.yaml')
             p.add_argument('--epochs', type=int, default=10)
             p.add_argument('--lr', type=float, default=2e-5)
+            p.add_argument('--plot-width', type=int, default=1600)
+            p.add_argument('--plot-zoom-start', type=int, default=200)
             p.add_argument('--loss', choices=['l1', 'spectrogram'], default='l1')
             p.add_argument('--ssim-weight', type=float, default=.1)
             p.add_argument('--gradient-weight', type=float, default=.2)
@@ -583,6 +607,10 @@ def main():
             p.add_argument('--decoder', choices=['best', 'baseline'], default='best',
                            help='best: fine-tuned checkpoint; baseline: original pretrained decoder')
             p.add_argument('--decoder-checkpoint', help='Relocated original baseline checkpoint (hash checked against run.json)')
+    p = sub.add_parser('plot')
+    p.add_argument('--run', required=True)
+    p.add_argument('--plot-width', type=int, default=1600)
+    p.add_argument('--plot-zoom-start', type=int, default=200)
     p = sub.add_parser('decode')
     p.add_argument('--bundle', required=True)
     p.add_argument('--latents', required=True)
@@ -596,11 +624,13 @@ def main():
     if args.command == 'train' and any(not np.isfinite(v) or v < 0 for v in
             (args.ssim_weight, args.gradient_weight, args.profile_weight)):
         parser.error('loss weights must be finite and nonnegative')
+    if args.command in ('train', 'plot') and (args.plot_width < 1000 or args.plot_zoom_start < 0):
+        parser.error('plot-width must be at least 1000 and plot-zoom-start nonnegative')
     if args.command == 'prepare':
         rows = prepare_manifest(args.data_root, args.manifest, args.seed, args.layout)
         print(f'Wrote {len(rows)} records to {args.manifest}')
     else:
-        {'train': train, 'export': export, 'decode': decode, 'evaluate': report}[args.command](args)
+        {'train': train, 'export': export, 'decode': decode, 'evaluate': report, 'plot': replot}[args.command](args)
 
 
 if __name__ == '__main__':
