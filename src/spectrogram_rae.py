@@ -44,7 +44,7 @@ def device_for(name):
     return device
 
 
-def load_model(config, device):
+def load_model(config, device, decoder_checkpoint=None):
     cfg = OmegaConf.to_container(OmegaConf.load(config), resolve=True)
     params = dict(cfg['stage_1']['params'])
     # Resolve local config/checkpoint paths against this config, not the working directory.
@@ -58,6 +58,9 @@ def load_model(config, device):
     if (base / enc['dinov2_path']).exists():
         enc['dinov2_path'] = str(base / enc['dinov2_path'])
     params['encoder_params'] = enc
+    if decoder_checkpoint is not None:
+        params['pretrained_decoder_path'] = str(Path(decoder_checkpoint).resolve())
+        params['strict_decoder_loading'] = True
     model = RAE(**params).to(device)
     model.encoder.requires_grad_(False)
     model.encoder.eval()
@@ -456,13 +459,41 @@ def decode(args):
 def report(args):
     run = Path(args.run)
     rows = [r for r in read_manifest(run / 'samples.csv') if r['split'] == args.split]
-    device = device_for(args.device)
-    model, _ = load_model(run / 'resolved_config.yaml', device)
-    model.decoder.load_state_dict(torch.load(run / 'best_decoder.pt', map_location=device, weights_only=True))
+    source = getattr(args, 'decoder', 'best')
+    override = getattr(args, 'decoder_checkpoint', None)
+    if override and source != 'baseline':
+        raise ValueError('--decoder-checkpoint is only supported with --decoder baseline')
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
+    if any(out.iterdir()):
+        raise ValueError('Use an empty evaluation output directory to keep reports separate')
+    if source == 'baseline':
+        cfg = OmegaConf.load(run / 'resolved_config.yaml')
+        original = cfg.stage_1.params.get('pretrained_decoder_path')
+        if not original:
+            raise ValueError('Run configuration has no pretrained decoder checkpoint')
+        checkpoint = Path(override or original).expanduser()
+        if not checkpoint.is_absolute() and (run / checkpoint).exists():
+            checkpoint = run / checkpoint
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f'Original pretrained decoder not found: {checkpoint}. '
+                                    'Use --decoder-checkpoint to supply the same weights at their current path.')
+        provenance = json.loads((run / 'run.json').read_text())
+        if sha256(checkpoint) != provenance['initial_decoder_sha256']:
+            raise ValueError('Baseline decoder hash differs from the original training initialization')
+    else:
+        checkpoint = run / 'best_decoder.pt'
+    device = device_for(args.device)
+    model, _ = load_model(run / 'resolved_config.yaml', device,
+                          decoder_checkpoint=checkpoint if source == 'baseline' else None)
+    if source == 'best':
+        model.decoder.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     result = evaluate(model, loader(args.data_root, rows, args.batch_size, args.workers), device, rows, out / 'previews')
+    result['evaluation'] = {'decoder': source, 'checkpoint': str(checkpoint.resolve()),
+                            'checkpoint_sha256': sha256(checkpoint), 'split': args.split,
+                            'run': str(run.resolve()), 'sample_count': len(rows)}
     save_json(out / 'metrics.json', result)
+    print(f'Evaluated {source} decoder on {len(rows)} {args.split} images; report: {out / "metrics.json"}', flush=True)
 
 
 def main():
@@ -496,6 +527,9 @@ def main():
             p.add_argument('--run', required=True)
         if command == 'evaluate':
             p.add_argument('--split', choices=['val','test'], default='test')
+            p.add_argument('--decoder', choices=['best', 'baseline'], default='best',
+                           help='best: fine-tuned checkpoint; baseline: original pretrained decoder')
+            p.add_argument('--decoder-checkpoint', help='Relocated original baseline checkpoint (hash checked against run.json)')
     p = sub.add_parser('decode')
     p.add_argument('--bundle', required=True)
     p.add_argument('--latents', required=True)

@@ -161,6 +161,21 @@ class WorkflowTests(unittest.TestCase):
                                    output=str(decoded), device='cpu'))
             self.assertEqual(len(list(decoded.rglob('*.png'))), 3)
             report(SimpleNamespace(**common, run=str(run), output=str(root / 'test'), split='test'))
+            relocated = root / 'relocated_initial.pt'
+            relocated.write_bytes(initial.read_bytes())
+            baseline_out = root / 'baseline_report'
+            report(SimpleNamespace(**common, run=str(run), output=str(baseline_out), split='val',
+                                   decoder='baseline', decoder_checkpoint=str(relocated)))
+            baseline = json.loads((baseline_out / 'metrics.json').read_text())
+            original_baseline = json.loads((run / 'baseline_metrics.json').read_text())
+            self.assertEqual(baseline['image_mean'], original_baseline['image_mean'])
+            self.assertEqual(baseline['evaluation']['decoder'], 'baseline')
+            self.assertEqual(baseline['evaluation']['sample_count'], 1)
+            wrong = root / 'wrong.pt'
+            wrong.write_bytes(b'not the original checkpoint')
+            with self.assertRaisesRegex(ValueError, 'hash differs'):
+                report(SimpleNamespace(**common, run=str(run), output=str(root / 'wrong_report'),
+                                       split='val', decoder='baseline', decoder_checkpoint=str(wrong)))
             # Reloaded exported encoder matches the original frozen encoder parameters exactly.
             from spectrogram_rae import load_model
             restored, _ = load_model(handoff / 'inference.yaml', torch.device('cpu'))

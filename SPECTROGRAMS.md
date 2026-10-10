@@ -280,3 +280,56 @@ Overall RMSE/PSNR are averages of per-image scores, not metrics recomputed from
 pooled MSE. `image_mean` weights images equally; `patient_mean` weights patient
 averages equally. Test images are read only when test evaluation is requested
 (or cache export is run), not during training validation.
+
+## Re-evaluate the pretrained baseline with all current metrics
+
+Use `evaluate --decoder baseline` to reconstruct the selected split with the
+original pretrained decoder recorded in the training run's `resolved_config.yaml`.
+It does not load `best_decoder.pt`, train anything, or change your run. It uses
+identical image preprocessing, frozen encoder, metric definitions, and sample
+ordering as fine-tuned evaluation. The original decoder's checksum is verified
+against `initial_decoder_sha256` in `run.json` to prevent accidentally evaluating
+different weights. All saved runs from this workflow contain that provenance.
+
+From the RAE repository root, with `rae-gpu` activated:
+
+```bash
+python src/spectrogram_rae.py evaluate \
+  --run exps/first_exp_loss_batch/ACTUAL_RUN_FOLDER \
+  --split val --decoder baseline \
+  --data-root ~/RAE_first_exp \
+  --output exps/first_exp_pretrained_eval \
+  --device cuda:0
+
+python src/spectrogram_rae.py evaluate \
+  --run exps/first_exp_loss_batch/ACTUAL_RUN_FOLDER \
+  --split val --decoder best \
+  --data-root ~/RAE_first_exp \
+  --output exps/first_exp_finetuned_eval \
+  --device cuda:0
+```
+
+Replace `ACTUAL_RUN_FOLDER` with the subfolder containing `samples.csv`,
+`resolved_config.yaml`, `run.json`, and `best_decoder.pt`. Both output directories
+must be empty or new. `--decoder best` remains the default for existing commands.
+With `--split val`, test images are not read.
+
+Each output contains `metrics.json` with L1, MSE, RMSE, SSIM, PSNR, profile errors,
+and clipping fraction for all selected images, per patient, and overall. It also
+records decoder source, checkpoint path/hash, split, and sample count. `previews/`
+contains the first 16 input-on-left/reconstruction-on-right PNG pairs and raw
+float RGB reconstruction arrays. Compare baseline and fine-tuned metrics and
+matching preview numbers; no automated winner is selected or checkpoint changed.
+Existing older training runs need no retraining to obtain SSIM and PSNR.
+
+If the pretrained decoder file has moved since training, add this option to the
+baseline command (the original encoder/config assets must also remain available):
+
+```bash
+--decoder-checkpoint /current/path/to/models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt
+```
+
+The supplied file must match the original initialization checksum. This option
+is available only with `--decoder baseline`; it does not accept a fine-tuned
+checkpoint as the baseline. Original `baseline_metrics.json` and `baseline/`
+outputs remain unchanged.
