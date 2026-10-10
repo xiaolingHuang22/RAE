@@ -180,7 +180,7 @@ def write_loss_plot(history, path):
     Path(path).write_text('\n'.join(parts))
 
 
-def write_batch_loss_plot(batches, epochs, path, steps_per_epoch):
+def write_batch_loss_plot(batches, epochs, path, steps_per_epoch, objective=False):
     """Plot raw batch losses and epoch validation at their global batch steps.
 
     Keep CSV data complete; use min/max buckets to bound SVG size while retaining
@@ -188,7 +188,7 @@ def write_batch_loss_plot(batches, epochs, path, steps_per_epoch):
     """
     if not batches:
         return
-    points = [(r['global_step'], r['l1']) for r in batches]
+    points = [(r['global_step'], r['loss' if objective else 'l1']) for r in batches]
     if len(points) > 1400:
         bucket_size = (len(points) + 699) // 700
         reduced = []
@@ -197,16 +197,17 @@ def write_batch_loss_plot(batches, epochs, path, steps_per_epoch):
             reduced.extend(sorted({min(bucket, key=lambda p: p[1]),
                                    max(bucket, key=lambda p: p[1])}))
         points = [points[0], *reduced, points[-1]]
-    validation = [(r['epoch'] * steps_per_epoch, r['val_l1']) for r in epochs]
+    validation = [(r['epoch'] * steps_per_epoch, r['val_loss' if objective else 'val_l1']) for r in epochs]
     xmax = max(1, batches[-1]['global_step'])
     ymax = max([p[1] for p in points + validation] + [1e-8]) * 1.1
     def coordinate(point):
         x, y = point
         return 85 + x / xmax * 675, 370 - y / ymax * 325
+    title = 'Composite reconstruction objective' if objective else 'Reconstruction L1 by batch step'
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440">',
              '<rect width="100%" height="100%" fill="white"/>',
              '<g font-family="sans-serif" font-size="13" fill="#222">',
-             '<text x="85" y="25">Reconstruction L1 by batch step</text>',
+             f'<text x="85" y="25">{title}</text>',
              '<text x="445" y="25" fill="#2563eb">Training batch</text>',
              '<text x="590" y="25" fill="#e45b20">Validation (epoch)</text>']
     for i in range(6):

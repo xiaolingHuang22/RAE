@@ -333,3 +333,118 @@ The supplied file must match the original initialization checksum. This option
 is available only with `--decoder baseline`; it does not accept a fine-tuned
 checkpoint as the baseline. Original `baseline_metrics.json` and `baseline/`
 outputs remain unchanged.
+
+## Structure-aware loss for SEEG spectrogram reconstruction
+
+For a model conditioned on nearby anatomical locations in other patients, the
+first RAE goal is faithful reconstruction of each available image. Relevant
+candidate features are relative spectral intensity, sustained frequency patterns,
+transient timing/width/contrast, and the evolution of activity over time. Do not
+assume that every background speckle is meaningful or that nearby locations in
+different people uniquely determine a missing patient's signal. Cross-patient
+conditional generation needs its own validation of the generated distribution,
+conditioning benefit, variability, and location consistency; RAE reconstruction
+scores alone cannot validate it. Consult your PI about the physiological targets.
+
+An optional loss now targets these features:
+
+```
+L = L1 + 0.1*(1-SSIM) + 0.2*gradient_L1 + 0.1*profile_L1
+```
+
+- L1 anchors reconstruction to actual pixel intensities.
+- SSIM measures local contrast and structure with the same 11x11 Gaussian
+  definition as evaluation. It does not establish preservation of clinical bands.
+- Gradient L1 compares signed adjacent-pixel differences with the target, averaged
+  equally across horizontal/time and vertical/frequency directions. This penalizes
+  missing or displaced edges as well as invented edges; it does not reward
+  indiscriminate sharpening. Fine texture can also be emphasized, so ablate it.
+- Profile L1 averages two errors: row intensities averaged across channels/time,
+  and column intensities averaged across channels/frequency. These encourage the
+  distribution of spectral intensity and the activity envelope. They are image
+  intensity summaries, not physical band power or raw SEEG amplitude measures.
+
+Terms use unclipped float RGB on the existing fixed [0,1] intensity scale. Loss
+calculations are fp32 even with mixed-precision model training. The weights above
+are starting hypotheses, not validated physiological settings. No GAN/LPIPS,
+latent noise, geometric augmentation, input rescaling change, or encoder update
+is introduced. L1 remains the default for backward compatibility.
+
+### Run the first controlled comparison
+
+Reuse the existing manifest. Start a new run from the same original pretrained
+decoder, not from your previously smoothed decoder, to isolate the objective:
+
+```bash
+python src/spectrogram_rae.py train \
+  --config configs/stage1/training/spectrogram.yaml \
+  --data-root ~/RAE_first_exp \
+  --manifest /path/to/existing/subset_samples.csv \
+  --output exps/structure_loss_01 \
+  --epochs 10 --batch-size 4 --lr 2e-5 \
+  --precision bf16 --device cuda:0 \
+  --loss spectrogram \
+  --ssim-weight 0.1 --gradient-weight 0.2 --profile-weight 0.1
+```
+
+Use the same seed, initialization, batch size, and learning rate as the L1 run.
+Keep the decoder weights specified by the config unchanged. `--resume` requires
+identical loss settings: it cannot switch an existing L1 run to the new loss.
+To repeat the original experiment, use `--loss l1` and another output directory.
+Zero weights allow ablations (e.g. SSIM only as an addition to L1).
+
+`batch_losses.csv` records `l1`, combined `loss`, unweighted `ssim_loss`,
+`gradient_l1`, and `profile_l1`; these structure columns are zero/inactive in L1
+mode. `losses.csv` retains the L1/SSIM/PSNR summaries and adds `train_loss` and
+`val_loss`. `loss_plot.svg` still plots L1 for comparability with existing runs;
+`objective_plot.svg` plots the composite training objective and epoch validation
+objective. Composite values should not be compared to L1 values as if they were
+the same metric. Different weights also change the objective's scale.
+
+For `--loss spectrogram`, `best_decoder.pt` minimizes the same composite
+validation objective, averaged equally across patients. `best_validation.json`
+records the weights and selection value. For `--loss l1`, selection remains by
+validation L1. Export/cache/decode commands and model formats are unchanged.
+
+Evaluate the chosen model without reading test images:
+
+```bash
+python src/spectrogram_rae.py evaluate \
+  --run exps/structure_loss_01 --split val --decoder best \
+  --data-root ~/RAE_first_exp \
+  --output exps/structure_loss_01_eval --device cuda:0
+```
+
+Reports additionally include `time_gradient_l1`, `frequency_gradient_l1`, their
+average `gradient_l1`, and `profile_l1`. Lower is better, but gradient error is
+not itself a validated event detector. Compare all models on the same held-out
+patients using metrics and matched previews. Inspect both event-rich and quiet
+examples; watch for attenuation, event displacement, spurious stripes, and
+artificial texture. A higher SSIM alone is not sufficient.
+
+### Suggested next experiments and downstream checks
+
+1. Compare pretrained, L1-only, and the composite loss above with fixed settings.
+2. If contrast improves but transients remain blurred, compare SSIM weights 0.05
+   and 0.1, then gradient weights 0.1 and 0.2. Change one setting at a time and
+   retain intensity/profile accuracy. Set profile weight to zero in an ablation.
+3. Once the objective is chosen, test learning rates separately, e.g. 2e-5 and
+   5e-5. Do not change learning rate and objective simultaneously in the first
+   comparison. Review patient-level results rather than image count alone.
+4. Before adding physical band/event metrics, record STFT window/hop, sampling
+   rate, frequency bins/axis direction, linear/log frequency mapping, time extent,
+   intensity-to-dB mapping and clipping, and channel referencing. Confirm that
+   width is time and height is frequency. Pixel rows cannot currently be assigned
+   defensible delta/theta/etc. bands, and PNGs do not recover phase/coherence.
+5. In the downstream task, align anatomical coordinates, referencing, frequency
+   and intensity conventions across patients. Keep all samples/conditions involving
+   a held-out target patient out of training and training normalization, and audit
+   pairing/negative selection for leakage. Compare against simple conditioning
+   baselines such as nearby-source averages and an unconditional model. Assess
+   feature distributions, variability and dependence on anatomical distance,
+   rather than demanding pixel-identical independent patients' time courses.
+
+If image reconstruction improves but the downstream model does not, investigate
+encoder features and conditional generation separately. Decoder-only training
+leaves the frozen DINO features unchanged. Changes in reconstructions therefore
+do not mean the cached encoder representation has become more SEEG-specific.

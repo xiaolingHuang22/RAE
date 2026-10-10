@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from transformers import (Dinov2WithRegistersConfig, Dinov2WithRegistersModel,
                           ViTMAEConfig, BitImageProcessor)
 from spectrogram_data import ChannelMoments, SpectrogramDataset, prepare_manifest, read_manifest
-from spectrogram_rae import train, export, decode, report, reconstruction_metrics
+from spectrogram_rae import train, export, decode, report, reconstruction_metrics, training_objective
 from stage1 import RAE
 
 
@@ -34,6 +34,21 @@ class WorkflowTests(unittest.TestCase):
         torch.testing.assert_close(changed['psnr'], torch.full((2,), 20.))
         expected_ssim = (2*.5*.6 + .01**2)/(.5**2 + .6**2 + .01**2)
         torch.testing.assert_close(changed['ssim'], torch.full((2,), expected_ssim), atol=5e-4, rtol=0)
+
+    def test_structure_loss_gradients(self):
+        torch.set_num_threads(1)
+        target = torch.rand(2, 3, 32, 32)
+        prediction = (target * .8).detach().requires_grad_(True)
+        settings = dict(mode='spectrogram', ssim_weight=.1, gradient_weight=.2, profile_weight=.1)
+        loss, terms = training_objective(prediction, target, settings)
+        self.assertGreater(loss.item(), terms['l1'].item())
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+        self.assertGreater(prediction.grad.abs().sum().item(), 0)
+        identity, _ = training_objective(target, target, settings)
+        self.assertLess(abs(identity.item()), 1e-5)
+        l1, _ = training_objective(prediction, target, dict(mode='l1'))
+        torch.testing.assert_close(l1, (prediction-target).abs().mean())
 
     def test_statistics(self):
         torch.manual_seed(2)
@@ -176,6 +191,18 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'hash differs'):
                 report(SimpleNamespace(**common, run=str(run), output=str(root / 'wrong_report'),
                                        split='val', decoder='baseline', decoder_checkpoint=str(wrong)))
+            structured_run = root / 'structured_run'
+            structured_args = dict(**common, output=str(structured_run), config=str(config),
+                                   manifest=str(manifest), epochs=1, lr=2e-5, seed=42,
+                                   precision='fp32', log_every=1, resume=False, loss='spectrogram',
+                                   ssim_weight=.1, gradient_weight=.2, profile_weight=.1)
+            train(SimpleNamespace(**structured_args))
+            structured_args['resume'] = True
+            train(SimpleNamespace(**structured_args))
+            self.assertTrue((structured_run / 'objective_plot.svg').exists())
+            selection = json.loads((structured_run / 'best_validation.json').read_text())
+            self.assertEqual(selection['loss_settings']['mode'], 'spectrogram')
+            self.assertTrue(np.isfinite(selection['selection_objective']))
             # Reloaded exported encoder matches the original frozen encoder parameters exactly.
             from spectrogram_rae import load_model
             restored, _ = load_model(handoff / 'inference.yaml', torch.device('cpu'))

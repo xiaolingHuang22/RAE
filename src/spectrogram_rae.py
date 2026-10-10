@@ -82,6 +82,41 @@ def amp_context(device, precision):
     return torch.autocast('cuda', dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
 
 
+def structure_errors(recon, target):
+    """Per-image signed gradient and intensity-profile errors (width=time)."""
+    error = recon.float() - target.float()
+    time_edge = (error[..., 1:] - error[..., :-1]).abs().mean((1, 2, 3))
+    frequency_edge = (error[:, :, 1:, :] - error[:, :, :-1, :]).abs().mean((1, 2, 3))
+    frequency_profile = error.mean(dim=(1, 3)).abs().mean(1)
+    time_profile = error.mean(dim=(1, 2)).abs().mean(1)
+    return {'time_gradient_l1': time_edge, 'frequency_gradient_l1': frequency_edge,
+            'gradient_l1': (time_edge + frequency_edge) / 2,
+            'profile_l1': (frequency_profile + time_profile) / 2}
+
+
+def loss_settings(args):
+    return {'mode': getattr(args, 'loss', 'l1'),
+            'ssim_weight': getattr(args, 'ssim_weight', .1),
+            'gradient_weight': getattr(args, 'gradient_weight', .2),
+            'profile_weight': getattr(args, 'profile_weight', .1)}
+
+
+def objective_from_metrics(metrics, settings):
+    if settings['mode'] == 'l1':
+        return metrics['l1']
+    return (metrics['l1'] + settings['ssim_weight'] * (1 - metrics['ssim'])
+            + settings['gradient_weight'] * metrics['gradient_l1']
+            + settings['profile_weight'] * metrics['profile_l1'])
+
+
+def training_objective(recon, target, settings):
+    values = {'l1': (recon.float() - target.float()).abs().mean()}
+    if settings['mode'] == 'spectrogram':
+        values.update({key: value.mean() for key, value in structure_errors(recon, target).items()})
+        values['ssim'] = reconstruction_metrics(recon, target)['ssim'].mean()
+    return objective_from_metrics(values, settings), values
+
+
 def reconstruction_metrics(recon, target):
     """Per-image metrics on unclipped RGB floats, fixed data range 1.
 
@@ -123,6 +158,7 @@ def evaluate(model, batches, device, rows, preview_dir=None):
             raise ValueError('Nonfinite reconstruction')
         error = recon - images
         image_metrics = reconstruction_metrics(recon, images)
+        image_metrics.update(structure_errors(recon, images))
         for i, index in enumerate(indices.tolist()):
             # Profiles compare mean intensity over time / frequency, preserving axis order.
             record = dict(rows[index])
@@ -143,7 +179,8 @@ def evaluate(model, batches, device, rows, preview_dir=None):
     if not records:
         raise ValueError('Evaluation split is empty')
     patients = sorted({r['patient_id'] for r in records})
-    metrics = ['l1', 'mse', 'rmse', 'ssim', 'psnr', 'frequency_profile_l1', 'temporal_profile_l1', 'clipped_fraction']
+    metrics = ['l1', 'mse', 'rmse', 'ssim', 'psnr', 'frequency_profile_l1', 'temporal_profile_l1', 'clipped_fraction',
+               'time_gradient_l1', 'frequency_gradient_l1', 'gradient_l1', 'profile_l1']
     by_patient = {p: {k: float(np.mean([r[k] for r in records if r['patient_id'] == p]))
                       for k in metrics} for p in patients}
     return {'metric_settings': {'data_range': 1.0, 'input': 'unclipped float RGB, no PNG quantization',
@@ -156,6 +193,7 @@ def evaluate(model, batches, device, rows, preview_dir=None):
 
 
 def train(args):
+    settings = loss_settings(args)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()) and not args.resume:
@@ -174,6 +212,8 @@ def train(args):
         for key in ('data_root', 'epochs', 'lr', 'seed', 'precision', 'batch_size'):
             if previous[key] != vars(args)[key]:
                 raise ValueError(f'Resume requires unchanged {key}')
+        if loss_settings(argparse.Namespace(**previous)) != settings:
+            raise ValueError('Resume requires unchanged loss settings; start a new experiment to change the loss')
         if sha256(args.manifest) != sha256(out / 'samples.csv'):
             raise ValueError('Resume manifest differs from saved patient split')
         cfg = OmegaConf.to_container(OmegaConf.load(out / 'resolved_config.yaml'), resolve=True)
@@ -230,7 +270,7 @@ def train(args):
         scaler.load_state_dict(state['scaler'])
         history = state['history']
         first_epoch = state['epoch'] + 1
-        best = json.loads((out / 'best_validation.json').read_text())['patient_mean']['l1']
+        best = objective_from_metrics(json.loads((out / 'best_validation.json').read_text())['patient_mean'], settings)
         torch.set_rng_state(state['rng'])
         if device.type == 'cuda':
             torch.cuda.set_rng_state_all(state['cuda_rng'])
@@ -244,8 +284,8 @@ def train(args):
             for row in csv.DictReader(f):
                 if int(row['epoch']) < first_epoch:
                     batch_history.append({key: (int(value) if key in ('epoch', 'batch', 'global_step')
-                                                else float(value)) for key, value in row.items()})
-    batch_fields = ['epoch', 'batch', 'global_step', 'l1', 'lr']
+                                                else float(value)) for key, value in row.items() if value != ''})
+    batch_fields = ['epoch', 'batch', 'global_step', 'l1', 'lr', 'loss', 'ssim_loss', 'gradient_l1', 'profile_l1']
     # Remove any interrupted epoch's rows before repeating that epoch on resume.
     with batch_path.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=batch_fields)
@@ -254,7 +294,7 @@ def train(args):
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         model.encoder.eval()
-        total, count = 0., 0
+        total, total_l1, count = 0., 0., 0
         with batch_path.open('a', newline='') as batch_file:
             batch_writer = csv.DictWriter(batch_file, fieldnames=batch_fields)
             for step, (images, _) in enumerate(batches, 1):
@@ -262,7 +302,8 @@ def train(args):
                 optimizer.zero_grad(set_to_none=True)
                 with amp_context(device, args.precision):
                     recon = model(images)
-                    loss = (recon.float() - images).abs().mean()
+                # SSIM/covariance and all objective terms are evaluated in fp32.
+                loss, components = training_objective(recon, images, settings)
                 if not torch.isfinite(loss):
                     raise ValueError('Nonfinite training loss')
                 scaler.scale(loss).backward()
@@ -271,22 +312,28 @@ def train(args):
                 scaler.step(optimizer)
                 scaler.update()
                 total += loss.item() * len(images)
+                total_l1 += components['l1'].item() * len(images)
                 count += len(images)
                 global_step = (epoch - 1) * len(batches) + step
                 batch_row = {'epoch': epoch, 'batch': step, 'global_step': global_step,
-                             'l1': loss.item(), 'lr': optimizer.param_groups[0]['lr']}
+                             'l1': components['l1'].item(), 'lr': optimizer.param_groups[0]['lr'],
+                             'loss': loss.item(), 'ssim_loss': 1-components['ssim'].item() if 'ssim' in components else 0.,
+                             'gradient_l1': components['gradient_l1'].item() if 'gradient_l1' in components else 0.,
+                             'profile_l1': components['profile_l1'].item() if 'profile_l1' in components else 0.}
                 batch_writer.writerow(batch_row)
                 batch_file.flush()
                 batch_history.append(batch_row)
                 if global_step == 1 or global_step % getattr(args, 'plot_every', 200) == 0:
                     write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
+                    if settings['mode'] == 'spectrogram':
+                        write_batch_loss_plot(batch_history, history, out / 'objective_plot.svg', len(batches), objective=True)
                 if step % args.log_every == 0:
-                    print(f'Epoch {epoch} batch {step}/{len(batches)} L1={loss.item():.6f}', flush=True)
+                    print(f'Epoch {epoch} batch {step}/{len(batches)} L1={components["l1"].item():.6f} loss={loss.item():.6f}', flush=True)
         metrics = evaluate(model, val_batches, device, validation)
         # Patient weighting avoids allowing patients with many channels to dominate selection.
-        val = metrics['patient_mean']['l1']
-        history.append({'epoch': epoch, 'train_l1': total / count,
-                        'val_l1': val, 'val_image_l1': metrics['image_mean']['l1'],
+        val = objective_from_metrics(metrics['patient_mean'], settings)
+        history.append({'epoch': epoch, 'train_l1': total_l1 / count, 'train_loss': total / count, 'val_loss': val,
+                        'val_l1': metrics['patient_mean']['l1'], 'val_image_l1': metrics['image_mean']['l1'],
                         'val_mse': metrics['patient_mean']['mse'],
                         'val_rmse': metrics['patient_mean']['rmse'],
                         'val_ssim': metrics['patient_mean']['ssim'],
@@ -298,17 +345,19 @@ def train(args):
             writer.writerows(history)
         write_loss_plot(history, out / 'epoch_loss_plot.svg')
         write_batch_loss_plot(batch_history, history, out / 'loss_plot.svg', len(batches))
+        if settings['mode'] == 'spectrogram':
+            write_batch_loss_plot(batch_history, history, out / 'objective_plot.svg', len(batches), objective=True)
         if val < best:
             best = val
             torch.save(model.decoder.state_dict(), out / 'best_decoder.pt')
-            save_json(out / 'best_validation.json', {'epoch': epoch, **metrics})
+            save_json(out / 'best_validation.json', {'epoch': epoch, 'selection_objective': val, 'loss_settings': settings, **metrics})
         temporary = out / 'last_training.tmp'
         torch.save({'epoch': epoch, 'decoder': model.decoder.state_dict(),
                     'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(), 'history': history, 'rng': torch.get_rng_state(),
                     'cuda_rng': torch.cuda.get_rng_state_all() if device.type == 'cuda' else []}, temporary)
         temporary.replace(out / 'last_training.pt')
-        print(f'Epoch {epoch}: train L1={total/count:.6f}, val patient L1={val:.6f}', flush=True)
+        print(f'Epoch {epoch}: train L1={total_l1/count:.6f}, val patient L1={metrics["patient_mean"]["l1"]:.6f}, val objective={val:.6f}', flush=True)
     model.decoder.load_state_dict(torch.load(out / 'best_decoder.pt', map_location=device, weights_only=True))
     save_json(out / 'validation_metrics.json', evaluate(model, val_batches, device, validation, out / 'validation'))
 
@@ -357,7 +406,7 @@ def export(args):
     shutil.copyfile(args.manifest, out / 'samples.csv')
     for name in ('baseline_metrics.json', 'validation_metrics.json', 'losses.csv', 'loss_plot.svg'):
         shutil.copyfile(run / name, out / name)
-    for name in ('batch_losses.csv', 'epoch_loss_plot.svg'):
+    for name in ('batch_losses.csv', 'epoch_loss_plot.svg', 'objective_plot.svg'):
         if (run / name).exists():
             shutil.copyfile(run / name, out / name)
     src = Path(__file__).resolve().parent
@@ -518,6 +567,10 @@ def main():
             p.add_argument('--config', default='configs/stage1/training/spectrogram.yaml')
             p.add_argument('--epochs', type=int, default=10)
             p.add_argument('--lr', type=float, default=2e-5)
+            p.add_argument('--loss', choices=['l1', 'spectrogram'], default='l1')
+            p.add_argument('--ssim-weight', type=float, default=.1)
+            p.add_argument('--gradient-weight', type=float, default=.2)
+            p.add_argument('--profile-weight', type=float, default=.1)
             p.add_argument('--seed', type=int, default=42)
             p.add_argument('--precision', choices=['fp32','fp16','bf16'], default='fp32')
             p.add_argument('--log-every', type=int, default=20)
@@ -540,6 +593,9 @@ def main():
         parser.error('--batch-size must be positive')
     if args.command == 'train' and (args.epochs < 1 or args.lr <= 0 or args.log_every < 1 or args.plot_every < 1):
         parser.error('epochs, lr, log-every, and plot-every must be positive')
+    if args.command == 'train' and any(not np.isfinite(v) or v < 0 for v in
+            (args.ssim_weight, args.gradient_weight, args.profile_weight)):
+        parser.error('loss weights must be finite and nonnegative')
     if args.command == 'prepare':
         rows = prepare_manifest(args.data_root, args.manifest, args.seed, args.layout)
         print(f'Wrote {len(rows)} records to {args.manifest}')
